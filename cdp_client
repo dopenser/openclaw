@@ -394,6 +394,24 @@ class BaseCDP:
     def get_last_reply(self):
         js = f"""
         (function() {{
+            function extractTextWithLineBreaks(el) {{
+                let result = '';
+                for (let child of el.childNodes) {{
+                    if (child.nodeType === Node.TEXT_NODE) {{
+                        result += child.textContent;
+                    }} else if (child.nodeType === Node.ELEMENT_NODE) {{
+                        const tag = child.tagName.toLowerCase();
+                        if (tag === 'br') {{
+                            result += '\\n';
+                        }} else if (['p','div','li','tr','h1','h2','h3','h4','h5','h6','section','header','footer'].includes(tag)) {{
+                            result += extractTextWithLineBreaks(child) + '\\n';
+                        }} else {{
+                            result += extractTextWithLineBreaks(child);
+                        }}
+                    }}
+                }}
+                return result;
+            }}
             const selectors = {json.dumps(self.ASSISTANT_MSG_SELECTORS)};
             let all = [];
             for (const sel of selectors) {{
@@ -405,7 +423,7 @@ class BaseCDP:
             }}
             if (all.length === 0) return '';
             const last = all[all.length - 1];
-            return last.textContent || last.innerText || '';
+            return extractTextWithLineBreaks(last).trim();
         }})()
         """
         return self.evaluate(js)
@@ -413,20 +431,38 @@ class BaseCDP:
     def get_all_text(self):
         js = f"""
         (function() {{
+            function extractTextWithLineBreaks(el) {{
+                let result = '';
+                for (let child of el.childNodes) {{
+                    if (child.nodeType === Node.TEXT_NODE) {{
+                        result += child.textContent;
+                    }} else if (child.nodeType === Node.ELEMENT_NODE) {{
+                        const tag = child.tagName.toLowerCase();
+                        if (tag === 'br') {{
+                            result += '\\n';
+                        }} else if (['p','div','li','tr','h1','h2','h3','h4','h5','h6','section','header','footer'].includes(tag)) {{
+                            result += extractTextWithLineBreaks(child) + '\\n';
+                        }} else {{
+                            result += extractTextWithLineBreaks(child);
+                        }}
+                    }}
+                }}
+                return result;
+            }}
             const selectors = {json.dumps(self.ASSISTANT_MSG_SELECTORS)};
             let all = [];
             for (const sel of selectors) {{
                 const nodes = document.querySelectorAll(sel);
                 if (nodes.length > 0) {{
-                    all = Array.from(nodes).map(n => n.textContent || '');
+                    all = Array.from(nodes);
                     break;
                 }}
             }}
             if (all.length === 0) {{
                 const chat = document.querySelector('.chat-container, .conversation, main');
-                return chat ? chat.textContent || '' : '';
+                return chat ? extractTextWithLineBreaks(chat).trim() : '';
             }}
-            return all.join('\\n');
+            return all.map(n => extractTextWithLineBreaks(n).trim()).join('\\n');
         }})()
         """
         return self.evaluate(js)
