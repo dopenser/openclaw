@@ -15,7 +15,8 @@ from model_config import get_model_config
 from lic_verifier import verify_license
 from chrome_launcher import launch_chrome_debug
 from prompt import (
-    estimate_tokens, parse_tools, extract_user_text, build_context
+    estimate_tokens, parse_tools, extract_user_text, build_context,
+    NO_TOOL_MARKER
 )
 from function_call import (
     extract_all_function_calls, is_likely_tool_call,
@@ -23,7 +24,7 @@ from function_call import (
 )
 from session import (
     get_session, update_session_tokens, should_new_chat, reset_session,
-    DEEPSEEK_MAX_TOKENS, TOKEN_THRESHOLD
+    DEEPSEEK_MAX_TOKENS, TOKEN_THRESHOLD, check_repeated_tool_call
 )
 
 # ---------- API 密钥管理 ----------
@@ -226,7 +227,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         _update_file_handler()
         request_id = uuid.uuid4().hex[:8]
 
-        # API 密钥认证
         auth_header = self.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
             self.send_response(401)
@@ -266,7 +266,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except:
             pass
 
-        # 记录工具返回消息（关键日志）
         messages = req.get('messages', [])
         for msg in messages:
             if msg.get('role') == 'tool':
@@ -350,6 +349,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         cdp = None
         stream_broken = False
+        force_plain_text = False
+        force_text = ""
         try:
             history_context = build_context(messages, user_text)
             tools_desc = parse_tools(tools)
@@ -427,7 +428,58 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             remaining = DEEPSEEK_MAX_TOKENS * TOKEN_THRESHOLD - new_total
             logger.info(f"[{request_id}] 📊 会话 {session_id[:8]} 累计 token: {new_total} / {int(DEEPSEEK_MAX_TOKENS * TOKEN_THRESHOLD)} (剩余 {max(0, remaining)} 触发切换)")
 
-            # ==================== 工具调用处理 ====================
+            # 纯文本标记检测
+            if reply.rstrip().endswith(NO_TOOL_MARKER):
+                logger.info(f"[{request_id}] 检测到纯文本回复标记，将直接返回文本内容")
+                clean_text = reply[:reply.rfind(NO_TOOL_MARKER)].rstrip()
+                if not clean_text:
+                    clean_text = " "
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+
+                for i in range(0, len(clean_text), 10):
+                    chunk = clean_text[i:i+10]
+                    delta = {"content": chunk}
+                    if i == 0:
+                        delta["role"] = "assistant"
+                    try:
+                        self._send_stream_event({
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": requested_model,
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                        })
+                    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as e:
+                        logger.error(f"[{request_id}] 发送纯文本块时连接中断: {e}")
+                        stream_broken = True
+                        break
+                    time.sleep(0.005)
+                if not stream_broken:
+                    try:
+                        self._send_stream_event({
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": requested_model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        })
+                    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as e:
+                        logger.error(f"[{request_id}] 发送 stop 标记失败: {e}")
+                        stream_broken = True
+                if not stream_broken:
+                    self._send_done()
+                else:
+                    logger.warning(f"[{request_id}] 由于连接中断，未发送 [DONE]")
+
+                logger.info(f"[{request_id}] 纯文本回复发送完毕")
+                return
+
+            # 工具调用处理
             func_calls = []
             debug_lines = []
             def debug_callback(msg):
@@ -455,6 +507,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     logger.info(f"[{request_id}] 工具调用[{idx}]: {fc_str}")
             else:
                 logger.info(f"[{request_id}] 无工具调用")
+
+            # ★ 重复工具调用拦截
+            if func_calls and check_repeated_tool_call(session_id, func_calls):
+                logger.warning(f"[{request_id}] 🔁 检测到重复工具调用，转为纯文本回复，避免循环")
+                force_plain_text = True
+                force_text = "该操作正在处理中，请稍后再查询。\n" + NO_TOOL_MARKER
+                func_calls = []
 
             for fc in func_calls:
                 if fc.get("name") == "exec" and "arguments" in fc:
@@ -562,9 +621,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         logger.error(f"[{request_id}] 发送 tool_calls 完成标记失败: {e}")
                         stream_broken = True
             else:
-                # 纯文本流式发送
-                for i in range(0, len(reply), 10):
-                    chunk = reply[i:i+10]
+                plain_text = force_text if force_plain_text else reply
+                for i in range(0, len(plain_text), 10):
+                    chunk = plain_text[i:i+10]
                     delta = {"content": chunk}
                     if i == 0:
                         delta["role"] = "assistant"
@@ -727,25 +786,20 @@ def run_self_test():
 
 
 def init_system():
+    """执行许可证验证、模型配置加载、启动 Chrome 调试窗口"""
     global CDP_CLASS, MODEL_NAME
     print("=" * 60)
     print("🔐 验证许可证...")
     valid, info = verify_license()
     if not valid:
         print(f"\n❌ 许可证验证失败: {info}")
-        print("程序将退出...")
-        sys.exit(1)
+        raise RuntimeError(f"许可证无效: {info}")
 
     MODEL_NAME = info.get("model", "deepseek")
     channel = info.get("channel", "unknown")
     print(f"\n📦 渠道: {channel}，指定模型: {MODEL_NAME}")
 
-    try:
-        cfg = get_model_config(MODEL_NAME)
-    except ValueError as e:
-        print(f"\n❌ {e}")
-        sys.exit(1)
-
+    cfg = get_model_config(MODEL_NAME)
     CDP_CLASS = cfg["cdp_class"]
     url = cfg["url"]
 
@@ -753,17 +807,54 @@ def init_system():
     print("=" * 60)
 
 
+# ---------- GUI 接口 ----------
+_server_instance = None
+_server_thread = None
+_stop_event = threading.Event()
+
+def start_proxy_server(host='0.0.0.0', port=9999):
+    """启动 HTTP 代理服务（非阻塞，在后台线程运行）"""
+    global _server_instance, _server_thread, _stop_event
+    if _server_instance:
+        raise RuntimeError("服务器已在运行")
+
+    # 初始化许可证和浏览器
+    init_system()
+    run_self_test()
+
+    _stop_event.clear()
+    _server_instance = HTTPServer((host, port), OpenAIHandler)
+    logger.info(f"🚀 DeepSeek Web 代理启动在 http://{host}:{port}/chat/completions")
+
+    _server_thread = threading.Thread(target=_server_instance.serve_forever)
+    _server_thread.daemon = True
+    _server_thread.start()
+    logger.info("服务线程已启动")
+
+def stop_proxy_server():
+    """停止代理服务"""
+    global _server_instance, _server_thread, _stop_event
+    if not _server_instance:
+        logger.warning("服务器未运行")
+        return
+    _stop_event.set()
+    _server_instance.shutdown()
+    _server_thread.join(timeout=3)
+    _server_instance.server_close()
+    _server_instance = None
+    _server_thread = None
+    logger.info("服务已安全停止")
+
+
+# 保留命令行直接启动的能力（不带 GUI）
 if __name__ == '__main__':
     logger.info("🚀 DeepSeek Web 代理 (多模型/许可验证)")
     logger.info("端点: http://localhost:9999/chat/completions")
     logger.info(f"🔑 API密钥: {API_KEY}  (存放于 {API_KEY_FILE})")
-
-    init_system()
-
-    run_self_test()
-
-    server = HTTPServer(('0.0.0.0', 9999), OpenAIHandler)
+    start_proxy_server()
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
+        stop_proxy_server()
         logger.info("服务已停止")
